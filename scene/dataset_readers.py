@@ -12,7 +12,7 @@
 import os
 import sys
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -22,14 +22,16 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import laspy
+from scipy.spatial.transform import Rotation as R
 
 class CameraInfo(NamedTuple):
     uid: int
-    R: np.array
-    T: np.array
-    FovY: np.array
-    FovX: np.array
-    depth_params: dict
+    R: np.ndarray
+    T: np.ndarray
+    FovY: float
+    FovX: float
+    depth_params: Optional[dict]
     image_path: str
     image_name: str
     depth_path: str
@@ -38,7 +40,7 @@ class CameraInfo(NamedTuple):
     is_test: bool
 
 class SceneInfo(NamedTuple):
-    point_cloud: BasicPointCloud
+    point_cloud: Optional[object]
     train_cameras: list
     test_cameras: list
     nerf_normalization: dict
@@ -309,7 +311,188 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            is_nerf_synthetic=True)
     return scene_info
 
+def quaternion_to_rotation_matrix(q_xyzw):
+    r = R.from_quat(q_xyzw)
+    return r.as_matrix()
+
+def read_las_pointcloud(las_path):
+    las = laspy.read(las_path)
+    xyz = np.vstack([las.x, las.y, las.z]).T
+    if hasattr(las, 'red'):
+        rgb = np.vstack([las.red, las.green, las.blue]).T
+        if rgb.max() > 255:
+            rgb = (rgb / 65535.0 * 255).astype(np.uint8)
+    else:
+        rgb = np.zeros_like(xyz)
+    return xyz, rgb
+
+def readCustomMetaSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+    import json
+    import os
+    import laspy
+    import csv
+    from scipy.spatial.transform import Rotation as R
+    from utils.graphics_utils import focal2fov
+    # 1. Parse meta.json
+    with open(os.path.join(path, "meta.json")) as f:
+        meta = json.load(f)
+    # 2. Parse calibration.csv
+    calib_path = os.path.join(path, "calibration.csv")
+    sensor_intrinsics = {}
+    with open(calib_path, newline='') as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            sensor_id = row['sensor_id']
+            sensor_intrinsics[sensor_id] = {
+                'width': None,  # will be filled per image
+                'height': None, # will be filled per image
+                'fx': float(row['focal_length_px_x']),
+                'fy': float(row['focal_length_px_y']),
+                'cx': float(row['principal_point_px_x']),
+                'cy': float(row['principal_point_px_y']),
+                'k1': float(row['k1']),
+                'k2': float(row['k2']),
+                'k3': float(row['k3']),
+                'p1': float(row['p1']),
+                'p2': float(row['p2']),
+                's1': float(row['s1']),
+                's2': float(row['s2']),
+            }
+    # 3. Read point cloud (auto-detect .las or .laz)
+    las_candidates = [f for f in os.listdir(path) if f.lower().endswith('.las') or f.lower().endswith('.laz')]
+    if not las_candidates:
+        raise FileNotFoundError("No .las or .laz file found in dataset root.")
+    las_path = os.path.join(path, las_candidates[0])
+    las = laspy.read(las_path)  # laspy supports both .las and .laz
+    xyz = np.vstack([las.x, las.y, las.z]).T
+    if hasattr(las, 'red'):
+        rgb = np.vstack([las.red, las.green, las.blue]).T
+        if rgb.max() > 255:
+            rgb = (rgb / 65535.0 * 255).astype(np.uint8)
+    else:
+        rgb = np.zeros_like(xyz)
+    ply_path = os.path.join(path, "pointcloud.ply")
+    storePly(ply_path, xyz, rgb)
+
+    # Print point cloud stats
+    print("[DEBUG] Point cloud stats:")
+    print(f"  Mean: {np.mean(xyz, axis=0)}")
+    print(f"  Min: {np.min(xyz, axis=0)}")
+    print(f"  Max: {np.max(xyz, axis=0)}")
+
+    def quaternion_to_rotation_matrix(q_xyzw):
+        r = R.from_quat(q_xyzw)
+        return r.as_matrix()
+
+    # 4. Scan images folder for actual image files
+    images_folder = os.path.join(path, "images")
+    if not os.path.exists(images_folder):
+        raise FileNotFoundError(f"Images folder not found: {images_folder}")
+    
+    # Get list of actual image files
+    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif']
+    actual_images = set()
+    for filename in os.listdir(images_folder):
+        if any(filename.lower().endswith(ext) for ext in image_extensions):
+            actual_images.add(filename)
+    
+    print(f"Found {len(actual_images)} actual image files in {images_folder}")
+    
+    # 5. Create mapping from image paths to meta.json entries
+    meta_image_map = {}
+    for img in meta["images"]:
+        image_filename = os.path.basename(img["path"])
+        meta_image_map[image_filename] = img
+    
+    print(f"Found {len(meta_image_map)} images in meta.json")
+    
+    # 6. Build CameraInfo list only for images that exist
+    cam_infos = []
+    processed_count = 0
+    skipped_count = 0
+    
+    for image_filename in actual_images:
+        if image_filename in meta_image_map:
+            img = meta_image_map[image_filename]
+            sensor_id = str(img["sensor_id"])
+            
+            if sensor_id not in sensor_intrinsics:
+                print(f"Warning: No calibration data for sensor_id '{sensor_id}', skipping {image_filename}")
+                skipped_count += 1
+                continue
+                
+            intr = sensor_intrinsics[sensor_id]
+            q = img["pose"]["orientation_xyzw"]
+            t = img["pose"]["translation"]
+            Rmat = quaternion_to_rotation_matrix(q)
+            Tvec = np.array(t)
+            
+            # Get image size from file
+            image_path = os.path.join(images_folder, image_filename)
+            try:
+                with Image.open(image_path) as im:
+                    width, height = im.size
+            except Exception as e:
+                print(f"Warning: Could not read image {image_path}: {e}")
+                skipped_count += 1
+                continue
+            
+            fx = intr['fx']
+            fy = intr['fy']
+            FovX = focal2fov(fx, width)
+            FovY = focal2fov(fy, height)
+            
+            cam_infos.append(CameraInfo(
+                uid=img["sensor_id"],
+                R=Rmat,
+                T=Tvec,
+                FovY=FovY,
+                FovX=FovX,
+                depth_params={},  # Use empty dict instead of None
+                image_path=image_path,
+                image_name=image_filename,
+                depth_path="",
+                width=width,
+                height=height,
+                is_test=False
+            ))
+            processed_count += 1
+        else:
+            print(f"Warning: Image {image_filename} exists but not found in meta.json, skipping")
+            skipped_count += 1
+    
+    print(f"Processed {processed_count} images, skipped {skipped_count} images")
+    
+    if processed_count == 0:
+        raise ValueError("No valid images found! Check that images exist and match meta.json entries.")
+
+    # Print camera centers stats
+    if len(cam_infos) > 0:
+        cam_centers = np.array([c.T for c in cam_infos])
+        print("[DEBUG] Camera centers stats:")
+        print(f"  Mean: {np.mean(cam_centers, axis=0)}")
+        print(f"  Min: {np.min(cam_centers, axis=0)}")
+        print(f"  Max: {np.max(cam_centers, axis=0)}")
+    else:
+        print("[DEBUG] No camera centers to print stats for.")
+
+    nerf_normalization = getNerfppNorm(cam_infos)
+    pcd = fetchPly(ply_path)
+    if pcd is None:
+        # Create a dummy BasicPointCloud if fetchPly failed
+        pcd = BasicPointCloud(points=np.zeros((0, 3)), colors=np.zeros((0, 3)), normals=np.zeros((0, 3)))
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        train_cameras=cam_infos,
+        test_cameras=[],
+        nerf_normalization=nerf_normalization,
+        ply_path=ply_path,
+        is_nerf_synthetic=False
+    )
+    return scene_info
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender": readNerfSyntheticInfo,
+    "CustomMeta": readCustomMetaSceneInfo,
 }
