@@ -398,77 +398,75 @@ def readCustomMetaSceneInfo(path, images, depths, eval, train_test_exp, llffhold
     
     print(f"Found {len(actual_images)} actual image files in {images_folder}")
     
-    # 5. Create mapping from image paths to meta.json entries
+    # 5. Create mapping from image paths to meta.json entries (support both 'images' and 'converted_images')
     meta_image_map = {}
-    for img in meta["images"]:
+    all_meta_images = meta.get("images", [])
+    if "converted_images" in meta:
+        all_meta_images += meta["converted_images"]
+    for img in all_meta_images:
         image_filename = os.path.basename(img["path"])
         meta_image_map[image_filename] = img
-    
-    print(f"Found {len(meta_image_map)} images in meta.json")
-    
-    # 6. Build CameraInfo list only for images that exist
+
+    # Print total unique image filenames in meta['images'] + meta['converted_images']
+    all_meta_filenames = set(os.path.basename(img['path']) for img in all_meta_images)
+    print(f"[INFO] Total unique image filenames in meta['images'] + meta['converted_images']: {len(all_meta_filenames)}")
+
+    # 6. Build CameraInfo list for all unique images in meta (if file exists)
     cam_infos = []
     processed_count = 0
     skipped_count = 0
-    
-    for image_filename in actual_images:
-        if image_filename in meta_image_map:
-            img = meta_image_map[image_filename]
-            sensor_id = str(img["sensor_id"])
-            
-            if sensor_id not in sensor_intrinsics:
-                print(f"Warning: No calibration data for sensor_id '{sensor_id}', skipping {image_filename}")
-                skipped_count += 1
-                continue
-                
-            intr = sensor_intrinsics[sensor_id]
-            q = img["pose"]["orientation_xyzw"]
-            t = img["pose"]["translation"]
-            Rmat = quaternion_to_rotation_matrix(q)
-            Tvec = np.array(t)
-            
-            # Get image size from file
-            image_path = os.path.join(images_folder, image_filename)
-            try:
-                with Image.open(image_path) as im:
-                    width, height = im.size
-            except Exception as e:
-                print(f"Warning: Could not read image {image_path}: {e}")
-                skipped_count += 1
-                continue
-            
-            fx = intr['fx']
-            fy = intr['fy']
-            FovX = focal2fov(fx, width)
-            FovY = focal2fov(fy, height)
-            
-            cam_infos.append(CameraInfo(
-                uid=img["sensor_id"],
-                R=Rmat,
-                T=Tvec,
-                FovY=FovY,
-                FovX=FovX,
-                depth_params={},  # Use empty dict instead of None
-                image_path=image_path,
-                image_name=image_filename,
-                depth_path="",
-                width=width,
-                height=height,
-                is_test=False
-            ))
-            processed_count += 1
-        else:
-            print(f"Warning: Image {image_filename} exists but not found in meta.json, skipping")
+    cam_centers_list = []
+    for image_filename in all_meta_filenames:
+        image_path = os.path.join(images_folder, image_filename)
+        if not os.path.exists(image_path):
+            print(f"Warning: Image file {image_path} listed in meta.json but not found in images folder, skipping")
             skipped_count += 1
-    
+            continue
+        img = meta_image_map[image_filename]
+        sensor_id = str(img["sensor_id"])
+        if sensor_id not in sensor_intrinsics:
+            print(f"Warning: No calibration data for sensor_id '{sensor_id}', skipping {image_filename}")
+            skipped_count += 1
+            continue
+        intr = sensor_intrinsics[sensor_id]
+        q = img["pose"]["orientation_xyzw"]
+        t = img["pose"]["translation"]
+        Rmat = quaternion_to_rotation_matrix(q)
+        Tvec = np.array(t)
+        cam_centers_list.append(Tvec)
+        try:
+            with Image.open(image_path) as im:
+                width, height = im.size
+        except Exception as e:
+            print(f"Warning: Could not read image {image_path}: {e}")
+            skipped_count += 1
+            continue
+        fx = intr['fx']
+        fy = intr['fy']
+        FovX = focal2fov(fx, width)
+        FovY = focal2fov(fy, height)
+        cam_infos.append(CameraInfo(
+            uid=img["sensor_id"],
+            R=Rmat,
+            T=Tvec,
+            FovY=FovY,
+            FovX=FovX,
+            depth_params={},  # Use empty dict instead of None
+            image_path=image_path,
+            image_name=image_filename,
+            depth_path="",
+            width=width,
+            height=height,
+            is_test=False
+        ))
+        processed_count += 1
     print(f"Processed {processed_count} images, skipped {skipped_count} images")
-    
     if processed_count == 0:
         raise ValueError("No valid images found! Check that images exist and match meta.json entries.")
 
     # Print camera centers stats
     if len(cam_infos) > 0:
-        cam_centers = np.array([c.T for c in cam_infos])
+        cam_centers = np.array(cam_centers_list)
         print("[DEBUG] Camera centers stats:")
         print(f"  Mean: {np.mean(cam_centers, axis=0)}")
         print(f"  Min: {np.min(cam_centers, axis=0)}")
@@ -476,19 +474,88 @@ def readCustomMetaSceneInfo(path, images, depths, eval, train_test_exp, llffhold
     else:
         print("[DEBUG] No camera centers to print stats for.")
 
-    nerf_normalization = getNerfppNorm(cam_infos)
+    # --- MINIMUM-BASED CENTERING ---
+    # Compute min from point cloud
+    min_xyz = np.min(xyz, axis=0)
+    print(f"[DEBUG] Shifting scene by min: {min_xyz}")
+
+    # Shift point cloud
+    xyz_shifted = xyz - min_xyz
+    # Shift camera centers and update CameraInfo
+    cam_infos_shifted = []
+    for cam in cam_infos:
+        Tvec_shifted = cam.T - min_xyz
+        cam_infos_shifted.append(CameraInfo(
+            uid=cam.uid,
+            R=cam.R,
+            T=Tvec_shifted,
+            FovY=cam.FovY,
+            FovX=cam.FovX,
+            depth_params=cam.depth_params,
+            image_path=cam.image_path,
+            image_name=cam.image_name,
+            depth_path=cam.depth_path,
+            width=cam.width,
+            height=cam.height,
+            is_test=cam.is_test
+        ))
+
+    # Print shifted point cloud stats
+    print("[DEBUG] Shifted point cloud stats:")
+    print(f"  Mean: {np.mean(xyz_shifted, axis=0)}")
+    print(f"  Min: {np.min(xyz_shifted, axis=0)}")
+    print(f"  Max: {np.max(xyz_shifted, axis=0)}")
+    # Print shifted camera centers stats
+    if len(cam_infos_shifted) > 0:
+        cam_centers_shifted = np.array([c.T for c in cam_infos_shifted])
+        print("[DEBUG] Shifted camera centers stats:")
+        print(f"  Mean: {np.mean(cam_centers_shifted, axis=0)}")
+        print(f"  Min: {np.min(cam_centers_shifted, axis=0)}")
+        print(f"  Max: {np.max(cam_centers_shifted, axis=0)}")
+        # Compute robust radius as max distance from origin
+        radius = np.max(np.linalg.norm(cam_centers_shifted, axis=1))
+        print(f"[DEBUG] Computed robust radius: {radius}")
+        nerf_normalization = {"radius": float(radius)}
+    else:
+        print("[DEBUG] No shifted camera centers to print stats for.")
+        nerf_normalization = {"radius": 1.0}
+
+    # Save shifted point cloud
+    storePly(ply_path, xyz_shifted, rgb)
+
     pcd = fetchPly(ply_path)
     if pcd is None:
-        # Create a dummy BasicPointCloud if fetchPly failed
         pcd = BasicPointCloud(points=np.zeros((0, 3)), colors=np.zeros((0, 3)), normals=np.zeros((0, 3)))
     scene_info = SceneInfo(
         point_cloud=pcd,
-        train_cameras=cam_infos,
+        train_cameras=cam_infos_shifted,
         test_cameras=[],
         nerf_normalization=nerf_normalization,
         ply_path=ply_path,
         is_nerf_synthetic=False
     )
+    # Count how many images are found in 'images' and 'converted_images' in meta.json
+    images_list = meta.get('images', [])
+    converted_images_list = meta.get('converted_images', [])
+    images_set = set(os.path.basename(img['path']) for img in images_list)
+    converted_images_set = set(os.path.basename(img['path']) for img in converted_images_list)
+    found_in_images = 0
+    found_in_converted_images = 0
+    found_in_both = 0
+    for cam in cam_infos_shifted:
+        fname = cam.image_name
+        in_images = fname in images_set
+        in_converted = fname in converted_images_set
+        if in_images:
+            found_in_images += 1
+        if in_converted:
+            found_in_converted_images += 1
+        if in_images and in_converted:
+            found_in_both += 1
+    print(f"[INFO] Number of images successfully loaded for training: {len(cam_infos_shifted)}")
+    print(f"[INFO] Of these, found in meta['images']: {found_in_images}")
+    print(f"[INFO] Of these, found in meta['converted_images']: {found_in_converted_images}")
+    print(f"[INFO] Of these, found in BOTH: {found_in_both}")
     return scene_info
 
 sceneLoadTypeCallbacks = {
