@@ -236,10 +236,16 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, unnormalize=None):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
+        # Unnormalize if requested
+        if unnormalize is not None and 'translate' in unnormalize and 'radius' in unnormalize:
+            translate = np.array(unnormalize['translate']).reshape(1, 3)
+            radius = float(unnormalize['radius'])
+            xyz = xyz * radius - translate
+
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()

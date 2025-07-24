@@ -407,21 +407,17 @@ def readCustomMetaSceneInfo(path, images, depths, eval, train_test_exp, llffhold
         image_filename = os.path.basename(img["path"])
         meta_image_map[image_filename] = img
 
-    # Print total unique image filenames in meta['images'] + meta['converted_images']
-    all_meta_filenames = set(os.path.basename(img['path']) for img in all_meta_images)
-    print(f"[INFO] Total unique image filenames in meta['images'] + meta['converted_images']: {len(all_meta_filenames)}")
+    # Only process images that are present in both the images folder and meta.json
+    valid_image_filenames = actual_images.intersection(meta_image_map.keys())
+    print(f"[INFO] Number of images present in both images folder and meta.json: {len(valid_image_filenames)}")
 
-    # 6. Build CameraInfo list for all unique images in meta (if file exists)
+    # 6. Build CameraInfo list for all valid images
     cam_infos = []
     processed_count = 0
     skipped_count = 0
     cam_centers_list = []
-    for image_filename in all_meta_filenames:
+    for image_filename in valid_image_filenames:
         image_path = os.path.join(images_folder, image_filename)
-        if not os.path.exists(image_path):
-            print(f"Warning: Image file {image_path} listed in meta.json but not found in images folder, skipping")
-            skipped_count += 1
-            continue
         img = meta_image_map[image_filename]
         sensor_id = str(img["sensor_id"])
         if sensor_id not in sensor_intrinsics:
